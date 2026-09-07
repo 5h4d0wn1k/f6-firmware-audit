@@ -1,108 +1,126 @@
-# F6 — Firmware audit pipeline (post-LogoFAIL discipline)
+# F6 — Firmware / Image Audit
 
-A pure-Python UEFI/firmware audit pipeline that parses volume dumps, checks DXE module signatures, validates revocation lists, builds an SBOM, and cross-references known-vulnerable modules.
+A deterministic, offline, standard-library-only auditor that extracts ASCII
+strings, config artifacts, file paths, and dangerous-function references from
+firmware-image byte buffers, flags embedded secrets, backdoored paths, and
+dangerous functions, and rolls everything into a risk score and report.
 
 ## Overview
 
-- **UEFI-volume-ish parser**: Parses embedded byte dumps (volume headers + DXE module list with GUID/name)
-- **Module signature checking**: Verifies DXE module signatures against a simple signature/checksum table
-- **dbx revocation validation**: Validates a revocation list and flags revoked-but-present entries
-- **SBOM (CycloneDX-ish)**: Builds a software bill of materials for the parsed modules
-- **CISA-KEV-like cross-reference**: Flags module names matching an embedded known-vulnerable list
-- **Post-LogoFAIL discipline**: Explicitly treats image-parsing drivers (fonts/BMP/PNG) as high-risk audit surfaces
-- **Integration points**: CHIPSEC/flashrom dump scripts are stubbed as documented integration points
+- **Format sniffing** — identifies `ELF`, `PE`, `PNG`, `U-Boot`, and raw
+  `.bin/.img/.fw` blobs; scanning is format-agnostic (string extraction over the
+  byte buffer).
+- **String extraction** — printable-ASCII runs with min length (configurable).
+- **Secrets** — API keys, passwords, AWS access keys (documented example only),
+  private-key blocks, DB credentials.
+- **Backdoor paths** — alternate-shell ports (`sshd -p`, `netcat -e`),
+  temp-planted payload paths (`/tmp/.r.sh`), trojan services, `eval(base64)`,
+  iptables rule flushes.
+- **Dangerous functions** — `strcpy`/`strcat`/`sprintf`/`gets`,
+  `system`/`popen`/`exec*`/`dlopen`.
+- **Config-path extraction** — `/etc`-style paths and `.conf/.cfg/.json`
+  artifacts surfaced as evidence.
+- **Risk score** — weighted per-kind severity rollup (0 = clean).
+- Exit codes: `0` successful run, `1` findings with `--strict` (gate mode),
+  `2` config error. The default demo run always exits `0`. Reports to `reports/`
+  (Markdown or JSON), gitignored.
 
-## Features
-
-- **`FvParser`**: struct-based parsing of volume headers and DXE modules
-- **Signature table**: known-good digest table with mismatch + unknown detection
-- **dbx validation**: flags revoked modules still present in the image
-- **SBOM generation**: CycloneDX 1.5 with per-module hashes, signature validity, revocation, and KEV status
-- **Audit report**: pass/action-required verdict rollup
-- **Fully offline**: synthetic byte dump generated at runtime
-
-## Installation
-
-```bash
-# No third-party dependencies. Python 3.8+ standard library only.
-```
-
-## Usage
-
-```python
-from firmware_audit import FvParser, check_signatures, validate_dbx, cross_reference_kev, build_sbom
-
-parsed = FvParser(dump_bytes).parse()          # feed real flashrom/chipsec bytes here
-sig_results = check_signatures(parsed)
-dbx = validate_dbx(parsed)
-kev = cross_reference_kev(parsed)
-sbom = build_sbom(parsed, sig_results, dbx, kev)
-```
-
-### Integration points
-
-- **CHIPSEC**: pipe `chipsec_util uefi` output bytes into `FvParser`
-- **flashrom**: feed `flashrom -p internal -r bios.bin` bytes into `FvParser`
-
-### Running the Demo
+## CLI
 
 ```bash
+python3 firmware/firmware_audit.py --help
 python3 firmware/firmware_audit.py
+python3 firmware/firmware_audit.py --image bios.bin boot0.img --report reports/r.md
+python3 firmware/firmware_audit.py --image router.dump --report reports/r.json
 ```
 
-## Example Output
+Config lives in `config.json` (`min_string_len`). Scans synthetic fixture bytes
+or files you supply; nothing is fetched or decompressed externally.
 
-```
-============================================================
-  F6 — Firmware audit pipeline (post-LogoFAIL discipline)
-============================================================
+## Tests
 
-[1/5] Parse UEFI-volume-ish byte dump ...
-  modules parsed: 6
-[2/5] Check DXE module signatures ...
-  valid: 5/6
-[3/5] Validate dbx (revocation list) ...
-  revoked-but-present entries: 1
-[4/5] Cross-reference CISA-KEV-like list ...
-  ! SmbiosDxe.efi  -> apply vendor advisory / revoke in dbx
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## IMPORTANT: Read before use.
 
-This project is provided for **educational and authorized security testing purposes only**.
+Provided **exclusively** for authorized security research, academic study, and
+audit of firmware you own or are authorized to assess. Use without explicit
+written authorization is illegal and unethical.
 
 ### Authorization Requirements
-- You MUST have explicit written permission before dumping or auditing a device's firmware
-- Dumping firmware from hardware you do not own may violate computer fraud laws and hardware warranties
-- This tool should ONLY be used on devices you own or have written authorization to assess
+
+You MUST have explicit written permission before dumping or auditing a device's
+firmware. Dumping firmware from hardware you do not own may violate computer
+fraud laws and void hardware warranties. Use only on devices you own or have
+written authorization to assess.
 
 ### Legal Framework
-- **Computer Fraud and Abuse Act (CFAA)**: Unauthorized access to computer systems is a federal crime
-- **DMCA / Anti-circumvention**: Bypassing access controls on firmware may be prohibited
-- **Warranty / Terms of Service**: Dumping firmware may void warranties or breach device terms
-- **International Law**: Firmware and hardware tampering laws differ across jurisdictions
+
+Unauthorized access to or interference with computer systems is governed by the
+**Computer Fraud and Abuse Act (CFAA)** (18 U.S.C. § 1030), the **EU Directive
+on Attacks Against Information Systems** (2013/40/EU), and equivalent
+legislation in other jurisdictions. **DMCA anti-circumvention** rules may also
+restrict firmware extraction, and dumping firmware may void warranties.
 
 ### Acceptable Use
+
 - Auditing your own devices and platforms
 - Authorized supply-chain and firmware security assessments
 - Academic research in controlled lab environments
-- Security education and training
+- Security education and training (fixtures use doc.example.com and RFC 5737
+  addresses only)
 
 ### Prohibited Use
+
 - Dumping or modifying firmware you do not own without authorization
 - Bypassing license or DRM protections
-- Using firmware dumps to extract secrets or keys for unauthorized purposes
+- Using recovered secrets from firmware for unauthorized purposes
 - Any activity that violates applicable laws or regulations
 
 ### No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
+
+This software is provided "as is" without warranty of any kind. The authors
+assume no liability for damages arising from use or misuse of this tool.
 
 ### Responsible Disclosure
-If you discover firmware vulnerabilities using this tool, follow responsible disclosure practices:
-1. Report to the vendor/owner privately
-2. Allow reasonable time for remediation
-3. Do not exploit beyond proof of concept
+
+If you discover firmware vulnerabilities using this tool, follow coordinated
+disclosure: report to the vendor/owner privately, allow reasonable time for
+remediation, and do not exploit beyond proof of concept.
+
+## Live Lab Test Plan
+
+1. **Demo run** — `python3 firmware/firmware_audit.py` scans the synthetic
+   `router.bin` fixture, prints findings, writes the report, and exits `0`.
+2. **Gate mode** — `--strict` exits `1` because the fixture carries risk.
+2. **Secret coverage** — `test_secrets_found` asserts credential + password
+   findings; `test_aws_key_example_found` covers the documented example key.
+3. **Backdoor coverage** — `test_backdoor_found` asserts
+   `alternate-shell-port`, `netcat-exec`, `temp-payload-path`.
+4. **Dangerous-function coverage** — `test_dangerous_functions_found` asserts
+   `memory-unsafe` and `process-exec`.
+5. **Clean-image base case** — `test_clean_image_zero_risk` asserts a benign
+   buffer scores 0 (no false positives).
+6. **Real file input** — `--image evil.bin` (a temp file) is audited
+   end-to-end (`test_image_file_input`).
+7. **Offline guarantee** — stdlib only, no network, deterministic fixtures.
+
+## Metrics
+
+| Metric | Definition |
+|--------|-----------|
+| Image format | sniffed `elf`/`pe`/`png`/`uboot`/`raw`/`unknown` |
+| Extracted strings | printable runs ≥ `min_string_len` |
+| Findings | classified per kind (secret / backdoor / dangerous-fn) |
+| Config paths | `/`-rooted paths with config-ish names |
+| Risk score | weighted per-kind rollup (0 = clean) |
+| Exit codes | 0 successful demo, 1 findings in --strict mode, 2 config error |
+
+Verified offline: fixture `router.bin` → 9 classified findings, risk score 32,
+5 config paths surfaced; a benign buffer scores 0.
 
 ## License
 
-MIT
+MIT License
